@@ -189,7 +189,7 @@ def test_artificial_viscosity(ctx_factory, dim, order):
     zeros = discr.zeros(actx)
 
     class TestBoundary:
-        def soln_gradient_flux(self, disc, btag, fluid_state, gas_model, **kwargs):
+        def cv_gradient_flux(self, disc, btag, state_minus, gas_model, **kwargs):
             fluid_state_int = project_fluid_state(disc, "vol", btag, fluid_state,
                                                   gas_model)
             cv_int = fluid_state_int.cv
@@ -198,8 +198,9 @@ def test_artificial_viscosity(ctx_factory, dim, order):
                                  interior=cv_int,
                                  exterior=cv_int)
             nhat = thaw(actx, disc.normal(btag))
-            from mirgecom.flux import gradient_flux_central
-            flux_weak = gradient_flux_central(bnd_pair, normal=nhat)
+            from mirgecom.flux import num_flux_central
+            from arraycontext import outer
+            flux_weak = outer(num_flux_central(bnd_pair.int, bnd_pair.ext), nhat)
             return disc.project(btag, "all_faces", flux_weak)
 
         def av_flux(self, disc, btag, diffusion, **kwargs):
@@ -209,8 +210,8 @@ def test_artificial_viscosity(ctx_factory, dim, order):
             from grudge.trace_pair import TracePair
             bnd_grad_pair = TracePair(btag, interior=diffusion_minus,
                                       exterior=diffusion_plus)
-            from mirgecom.flux import divergence_flux_central
-            flux_weak = divergence_flux_central(bnd_grad_pair, normal=nhat)
+            from mirgecom.flux import num_flux_central
+            flux_weak = num_flux_central(bnd_grad_pair.int, bnd_grad_pair.ext)@nhat
             return disc.project(btag, "all_faces", flux_weak)
 
     boundaries = {BTAG_ALL: TestBoundary()}
@@ -225,9 +226,8 @@ def test_artificial_viscosity(ctx_factory, dim, order):
     )
     gas_model = GasModel(eos=IdealSingleGas())
     fluid_state = make_fluid_state(cv=cv, gas_model=gas_model)
-    boundary_kwargs = {"gas_model": gas_model}
     rhs = av_laplacian_operator(discr, boundaries=boundaries,
-                                boundary_kwargs=boundary_kwargs,
+                                gas_model=gas_model,
                                 fluid_state=fluid_state, alpha=1.0, s0=-np.inf)
     err = discr.norm(rhs, np.inf)
     assert err < tolerance
@@ -243,7 +243,7 @@ def test_artificial_viscosity(ctx_factory, dim, order):
     )
     fluid_state = make_fluid_state(cv=cv, gas_model=gas_model)
     rhs = av_laplacian_operator(discr, boundaries=boundaries,
-                                boundary_kwargs=boundary_kwargs,
+                                gas_model=gas_model,
                                 fluid_state=fluid_state, alpha=1.0, s0=-np.inf)
     err = discr.norm(rhs, np.inf)
     assert err < tolerance
@@ -259,7 +259,7 @@ def test_artificial_viscosity(ctx_factory, dim, order):
     )
     fluid_state = make_fluid_state(cv=cv, gas_model=gas_model)
     rhs = av_laplacian_operator(discr, boundaries=boundaries,
-                                boundary_kwargs=boundary_kwargs,
+                                gas_model=gas_model,
                                 fluid_state=fluid_state, alpha=1.0, s0=-np.inf)
     err = discr.norm(2.*dim-rhs, np.inf)
     assert err < tolerance

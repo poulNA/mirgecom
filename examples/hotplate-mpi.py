@@ -29,11 +29,6 @@ import pyopencl as cl
 import pyopencl.tools as cl_tools
 from functools import partial
 
-from meshmode.array_context import (
-    PyOpenCLArrayContext,
-    SingleGridWorkBalancingPytatoArrayContext as PytatoPyOpenCLArrayContext
-)
-from mirgecom.profiling import PyOpenCLProfilingArrayContext
 from arraycontext import thaw
 from meshmode.mesh import BTAG_ALL, BTAG_NONE  # noqa
 
@@ -90,8 +85,11 @@ def _get_box_mesh(dim, a, b, n, t=None):
 @mpi_entry_point
 def main(ctx_factory=cl.create_some_context, use_logmgr=True,
          use_leap=False, use_profiling=False, casename=None,
-         rst_filename=None, actx_class=PyOpenCLArrayContext):
+         rst_filename=None, actx_class=None, lazy=False):
     """Drive the example."""
+    if actx_class is None:
+        raise RuntimeError("Array context class missing.")
+
     cl_ctx = ctx_factory()
 
     if casename is None:
@@ -102,6 +100,9 @@ def main(ctx_factory=cl.create_some_context, use_logmgr=True,
     rank = comm.Get_rank()
     nparts = comm.Get_size()
 
+    from mirgecom.simutil import global_reduce as _global_reduce
+    global_reduce = partial(_global_reduce, comm=comm)
+
     logmgr = initialize_logmgr(use_logmgr,
         filename=f"{casename}.sqlite", mode="wu", mpi_comm=comm)
 
@@ -111,13 +112,16 @@ def main(ctx_factory=cl.create_some_context, use_logmgr=True,
     else:
         queue = cl.CommandQueue(cl_ctx)
 
-    actx = actx_class(
-        queue,
-        allocator=cl_tools.MemoryPool(cl_tools.ImmediateAllocator(queue)))
+    if lazy:
+        actx = actx_class(comm, queue, mpi_base_tag=12000)
+    else:
+        actx = actx_class(comm, queue,
+                allocator=cl_tools.MemoryPool(cl_tools.ImmediateAllocator(queue)),
+                force_device_scalars=True)
 
     # timestepping control
     timestepper = rk4_step
-    t_final = 1e-6
+    t_final = 2e-7
     current_cfl = .1
     current_dt = 1e-8
     current_t = 0
@@ -316,9 +320,8 @@ def main(ctx_factory=cl.create_some_context, use_logmgr=True,
             health_error = True
             logger.info(f"{rank=}: NANs/Infs in pressure data.")
 
-        from mirgecom.simutil import allsync
-        if allsync(check_range_local(discr, "vol", dv.pressure, 86129, 86131),
-                  comm, op=MPI.LOR):
+        if global_reduce(check_range_local(discr, "vol", dv.pressure, 86129, 86131),
+                         op="lor"):
             health_error = True
             from grudge.op import nodal_max, nodal_min
             p_min = nodal_min(discr, "vol", dv.pressure)
@@ -329,8 +332,8 @@ def main(ctx_factory=cl.create_some_context, use_logmgr=True,
             health_error = True
             logger.info(f"{rank=}: NANs/INFs in temperature data.")
 
-        if allsync(check_range_local(discr, "vol", dv.temperature, 299, 401),
-                   comm, op=MPI.LOR):
+        if global_reduce(check_range_local(discr, "vol", dv.temperature, 299, 401),
+                         op="lor"):
             health_error = True
             from grudge.op import nodal_max, nodal_min
             t_min = actx.to_numpy(nodal_min(discr, "vol", dv.temperature))
@@ -364,11 +367,8 @@ def main(ctx_factory=cl.create_some_context, use_logmgr=True,
             if do_health:
                 from mirgecom.simutil import compare_fluid_solutions
                 component_errors = compare_fluid_solutions(discr, state, exact)
-                from mirgecom.simutil import allsync
-                health_errors = allsync(
-                    my_health_check(state, dv, component_errors), comm,
-                    op=MPI.LOR
-                )
+                health_errors = global_reduce(
+                    my_health_check(state, dv, component_errors), op="lor")
                 if health_errors:
                     if rank == 0:
                         logger.info("Fluid solution failed health check.")
@@ -461,13 +461,13 @@ if __name__ == "__main__":
     parser.add_argument("--restart_file", help="root name of restart file")
     parser.add_argument("--casename", help="casename to use for i/o")
     args = parser.parse_args()
+    lazy = args.lazy
     if args.profiling:
-        if args.lazy:
+        if lazy:
             raise ValueError("Can't use lazy and profiling together.")
-        actx_class = PyOpenCLProfilingArrayContext
-    else:
-        actx_class = PytatoPyOpenCLArrayContext if args.lazy \
-            else PyOpenCLArrayContext
+
+    from grudge.array_context import get_reasonable_array_context_class
+    actx_class = get_reasonable_array_context_class(lazy=lazy, distributed=True)
 
     logging.basicConfig(format="%(message)s", level=logging.INFO)
     if args.casename:
@@ -477,6 +477,7 @@ if __name__ == "__main__":
         rst_filename = args.restart_file
 
     main(use_logmgr=args.log, use_leap=args.leap, use_profiling=args.profiling,
-         casename=casename, rst_filename=rst_filename, actx_class=actx_class)
+         casename=casename, rst_filename=rst_filename, actx_class=actx_class,
+         lazy=lazy)
 
 # vim: foldmethod=marker

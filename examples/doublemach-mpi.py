@@ -30,12 +30,6 @@ import pyopencl as cl
 import pyopencl.tools as cl_tools
 from functools import partial
 
-from meshmode.array_context import (
-    PyOpenCLArrayContext,
-    SingleGridWorkBalancingPytatoArrayContext as PytatoPyOpenCLArrayContext
-)
-from mirgecom.profiling import PyOpenCLProfilingArrayContext
-
 from arraycontext import thaw
 from meshmode.mesh import BTAG_ALL, BTAG_NONE  # noqa
 from grudge.dof_desc import DTAG_BOUNDARY
@@ -129,10 +123,13 @@ def get_doublemach_mesh():
 
 @mpi_entry_point
 def main(ctx_factory=cl.create_some_context, use_logmgr=True,
-         use_overintegration=False, use_esdg=False,
-         use_leap=False, use_profiling=False,
-         casename=None, rst_filename=None, actx_class=PyOpenCLArrayContext):
+         use_leap=False, use_profiling=False, use_overintegration=False,
+         casename=None, rst_filename=None, actx_class=None, lazy=False,
+         use_esdg=False):
     """Drive the example."""
+    if actx_class is None:
+        raise RuntimeError("Array context class missing.")
+
     cl_ctx = ctx_factory()
 
     if casename is None:
@@ -152,9 +149,12 @@ def main(ctx_factory=cl.create_some_context, use_logmgr=True,
     else:
         queue = cl.CommandQueue(cl_ctx)
 
-    actx = actx_class(
-        queue,
-        allocator=cl_tools.MemoryPool(cl_tools.ImmediateAllocator(queue)))
+    if lazy:
+        actx = actx_class(comm, queue, mpi_base_tag=12000)
+    else:
+        actx = actx_class(comm, queue,
+                allocator=cl_tools.MemoryPool(cl_tools.ImmediateAllocator(queue)),
+                force_device_scalars=True)
 
     if use_esdg and not actx.supports_nonscalar_broadcasting:
         raise RuntimeError(
@@ -432,8 +432,7 @@ def main(ctx_factory=cl.create_some_context, use_logmgr=True,
                       gas_model=gas_model, quadrature_tag=quadrature_tag)
             + av_laplacian_operator(discr, fluid_state=fluid_state,
                                     boundaries=boundaries,
-                                    boundary_kwargs={"time": t,
-                                                     "gas_model": gas_model},
+                                    time=t, gas_model=gas_model,
                                     alpha=alpha, s0=s0, kappa=kappa,
                                     quadrature_tag=quadrature_tag)
         )
@@ -485,13 +484,13 @@ if __name__ == "__main__":
     parser.add_argument("--restart_file", help="root name of restart file")
     parser.add_argument("--casename", help="casename to use for i/o")
     args = parser.parse_args()
+    lazy = args.lazy
     if args.profiling:
-        if args.lazy:
+        if lazy:
             raise ValueError("Can't use lazy and profiling together.")
-        actx_class = PyOpenCLProfilingArrayContext
-    else:
-        actx_class = PytatoPyOpenCLArrayContext if args.lazy \
-            else PyOpenCLArrayContext
+
+    from grudge.array_context import get_reasonable_array_context_class
+    actx_class = get_reasonable_array_context_class(lazy=lazy, distributed=True)
 
     logging.basicConfig(format="%(message)s", level=logging.INFO)
     if args.casename:
@@ -501,7 +500,7 @@ if __name__ == "__main__":
         rst_filename = args.restart_file
 
     main(use_logmgr=args.log, use_leap=args.leap, use_profiling=args.profiling,
-         use_esdg=args.esdg, use_overintegration=args.overintegration,
+         use_esdg=args.esdg, use_overintegration=args.overintegration, lazy=lazy,
          casename=casename, rst_filename=rst_filename, actx_class=actx_class)
 
 # vim: foldmethod=marker

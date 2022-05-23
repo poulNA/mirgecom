@@ -29,7 +29,7 @@ import numpy.linalg as la  # noqa
 import logging
 import pytest
 
-from meshmode.dof_array import thaw
+from arraycontext import thaw
 from meshmode.mesh import BTAG_ALL, BTAG_NONE  # noqa
 from mirgecom.initializers import Lump
 from mirgecom.boundary import AdiabaticSlipBoundary
@@ -37,15 +37,22 @@ from mirgecom.eos import IdealSingleGas
 from grudge.eager import EagerDGDiscretization
 from grudge.trace_pair import interior_trace_pair, interior_trace_pairs
 from grudge.trace_pair import TracePair
-from meshmode.array_context import (  # noqa
-    pytest_generate_tests_for_pyopencl_array_context
-    as pytest_generate_tests)
+from grudge.dof_desc import as_dofdesc
+
+from mirgecom.inviscid import (
+    inviscid_facial_flux_rusanov,
+    inviscid_facial_flux_hll
+)
 from mirgecom.gas_model import (
     GasModel,
     make_fluid_state,
     project_fluid_state,
     make_fluid_state_trace_pairs
 )
+from meshmode.array_context import (  # noqa
+    pytest_generate_tests_for_pyopencl_array_context
+    as pytest_generate_tests)
+
 logger = logging.getLogger(__name__)
 
 
@@ -71,10 +78,11 @@ def test_slipwall_identity(actx_factory, dim):
 
     order = 3
     discr = EagerDGDiscretization(actx, mesh, order=order)
-    nodes = thaw(actx, discr.nodes())
+    nodes = thaw(discr.nodes(), actx)
+    eos = IdealSingleGas()
     orig = np.zeros(shape=(dim,))
-    nhat = thaw(actx, discr.normal(BTAG_ALL))
-    gas_model = GasModel(eos=IdealSingleGas())
+    nhat = thaw(discr.normal(BTAG_ALL), actx)
+    gas_model = GasModel(eos=eos)
 
     logger.info(f"Number of {dim}d elems: {mesh.nelements}")
 
@@ -122,7 +130,9 @@ def test_slipwall_identity(actx_factory, dim):
 
 @pytest.mark.parametrize("dim", [1, 2, 3])
 @pytest.mark.parametrize("order", [1, 2, 3, 4, 5])
-def test_slipwall_flux(actx_factory, dim, order):
+@pytest.mark.parametrize("flux_func", [inviscid_facial_flux_rusanov,
+                                       inviscid_facial_flux_hll])
+def test_slipwall_flux(actx_factory, dim, order, flux_func):
     """Check for zero boundary flux.
 
     Check for vanishing flux across the slipwall.
@@ -143,8 +153,8 @@ def test_slipwall_flux(actx_factory, dim, order):
         )
 
         discr = EagerDGDiscretization(actx, mesh, order=order)
-        nodes = thaw(actx, discr.nodes())
-        nhat = thaw(actx, discr.normal(BTAG_ALL))
+        nodes = thaw(discr.nodes(), actx)
+        nhat = thaw(discr.normal(BTAG_ALL), actx)
         h = 1.0 / nel_1d
 
         def bnd_norm(vec):
@@ -183,11 +193,8 @@ def test_slipwall_flux(actx_factory, dim, order):
                 avg_state = 0.5*(bnd_pair.int + bnd_pair.ext)
                 err_max = max(err_max, bnd_norm(np.dot(avg_state.momentum, nhat)))
 
-                from mirgecom.inviscid import inviscid_facial_flux
-
-                bnd_flux = \
-                    inviscid_facial_flux(discr=discr, gas_model=gas_model,
-                                         state_pair=state_pair, local=True)
+                normal = thaw(discr.normal(BTAG_ALL), actx)
+                bnd_flux = flux_func(state_pair, gas_model, normal)
 
                 err_max = max(err_max, bnd_norm(bnd_flux.mass),
                               bnd_norm(bnd_flux.energy))
@@ -215,9 +222,11 @@ def _get_box_mesh(dim, a, b, n):
 
 
 @pytest.mark.parametrize("dim", [1, 2, 3])
+@pytest.mark.parametrize("flux_func", [inviscid_facial_flux_rusanov,
+                                       inviscid_facial_flux_hll])
 # @pytest.mark.parametrize("order", [1, 2, 3, 4, 5])
 # def test_noslip(actx_factory, dim, order):
-def test_noslip(actx_factory, dim):
+def test_noslip(actx_factory, dim, flux_func):
     """Check IsothermalNoSlipBoundary viscous boundary treatment."""
     actx = actx_factory()
     order = 1
@@ -241,16 +250,17 @@ def test_noslip(actx_factory, dim):
     mesh = _get_box_mesh(dim=dim, a=a, b=b, n=npts_geom)
 
     discr = EagerDGDiscretization(actx, mesh, order=order)
-    nodes = thaw(actx, discr.nodes())
-    nhat = thaw(actx, discr.normal(BTAG_ALL))
+    nodes = thaw(discr.nodes(), actx)
+    nhat = thaw(discr.normal(BTAG_ALL), actx)
     print(f"{nhat=}")
 
-    from mirgecom.flux import gradient_flux_central
+    from mirgecom.flux import num_flux_central
 
     def scalar_flux_interior(int_tpair):
-        normal = thaw(actx, discr.normal(int_tpair.dd))
+        from arraycontext import outer
+        normal = thaw(discr.normal(int_tpair.dd), actx)
         # Hard-coding central per [Bassi_1997]_ eqn 13
-        flux_weak = gradient_flux_central(int_tpair, normal)
+        flux_weak = outer(num_flux_central(int_tpair.int, int_tpair.ext), normal)
         return discr.project(int_tpair.dd, "all_faces", flux_weak)
 
     # utility to compare stuff on the boundary only
@@ -297,13 +307,18 @@ def test_noslip(actx_factory, dim):
                                                        state_minus=state_minus)
             t_flux_bnd = t_flux_bc + t_flux_int
 
-            from mirgecom.inviscid import inviscid_facial_flux
             i_flux_bc = wall.inviscid_divergence_flux(discr, btag=BTAG_ALL,
                                                       gas_model=gas_model,
                                                       state_minus=state_minus)
 
-            i_flux_int = inviscid_facial_flux(discr=discr, gas_model=gas_model,
-                                              state_pair=state_pair)
+            nhat = thaw(discr.normal(state_pair.dd), actx)
+            bnd_flux = flux_func(state_pair, gas_model, nhat)
+            dd = state_pair.dd
+            dd_allfaces = dd.with_dtag("all_faces")
+            i_flux_int = discr.project(dd, dd_allfaces, bnd_flux)
+            bc_dd = as_dofdesc(BTAG_ALL)
+            i_flux_bc = discr.project(bc_dd, dd_allfaces, i_flux_bc)
+
             i_flux_bnd = i_flux_bc + i_flux_int
 
             print(f"{cv_flux_bnd=}")
@@ -311,7 +326,6 @@ def test_noslip(actx_factory, dim):
             print(f"{i_flux_bnd=}")
 
             from mirgecom.operators import grad_operator
-            from grudge.dof_desc import as_dofdesc
             dd_vol = as_dofdesc("vol")
             dd_faces = as_dofdesc("all_faces")
             grad_cv_minus = \
@@ -336,7 +350,9 @@ def test_noslip(actx_factory, dim):
 @pytest.mark.parametrize("dim", [1, 2, 3])
 # @pytest.mark.parametrize("order", [1, 2, 3, 4, 5])
 # def test_noslip(actx_factory, dim, order):
-def test_prescribedviscous(actx_factory, dim):
+@pytest.mark.parametrize("flux_func", [inviscid_facial_flux_rusanov,
+                                       inviscid_facial_flux_hll])
+def test_prescribedviscous(actx_factory, dim, flux_func):
     """Check viscous prescribed boundary treatment."""
     actx = actx_factory()
     order = 1
@@ -384,16 +400,18 @@ def test_prescribedviscous(actx_factory, dim):
     #     boundaries[DTAG_BOUNDARY("+"+str(i+1))] = 0
 
     discr = EagerDGDiscretization(actx, mesh, order=order)
-    nodes = thaw(actx, discr.nodes())
-    nhat = thaw(actx, discr.normal(BTAG_ALL))
+    nodes = thaw(discr.nodes(), actx)
+    nhat = thaw(discr.normal(BTAG_ALL), actx)
     print(f"{nhat=}")
 
-    from mirgecom.flux import gradient_flux_central
+    from mirgecom.flux import num_flux_central
 
     def scalar_flux_interior(int_tpair):
-        normal = thaw(actx, discr.normal(int_tpair.dd))
+        from arraycontext import outer
+        normal = thaw(discr.normal(int_tpair.dd), actx)
         # Hard-coding central per [Bassi_1997]_ eqn 13
-        flux_weak = gradient_flux_central(int_tpair, normal)
+        flux_weak = outer(num_flux_central(int_tpair.int, int_tpair.ext),
+                          normal)
         return discr.project(int_tpair.dd, "all_faces", flux_weak)
 
     # utility to compare stuff on the boundary only
@@ -435,15 +453,21 @@ def test_prescribedviscous(actx_factory, dim):
                                                        state_minus=state_minus)
             t_flux_bnd = t_flux_bc + t_flux_int
 
-            from mirgecom.inviscid import inviscid_facial_flux
             i_flux_bc = wall.inviscid_divergence_flux(discr, btag=BTAG_ALL,
                                                       gas_model=gas_model,
                                                       state_minus=state_minus)
             cv_int_pairs = interior_trace_pairs(discr, cv)
             state_pairs = make_fluid_state_trace_pairs(cv_int_pairs, gas_model)
             state_pair = state_pairs[0]
-            i_flux_int = inviscid_facial_flux(discr, gas_model=gas_model,
-                                              state_pair=state_pair)
+
+            nhat = thaw(discr.normal(state_pair.dd), actx)
+            bnd_flux = flux_func(state_pair, gas_model, nhat)
+            dd = state_pair.dd
+            dd_allfaces = dd.with_dtag("all_faces")
+            bc_dd = as_dofdesc(BTAG_ALL)
+            i_flux_bc = discr.project(bc_dd, dd_allfaces, i_flux_bc)
+            i_flux_int = discr.project(dd, dd_allfaces, bnd_flux)
+
             i_flux_bnd = i_flux_bc + i_flux_int
 
             print(f"{cv_flux_bnd=}")
@@ -451,7 +475,6 @@ def test_prescribedviscous(actx_factory, dim):
             print(f"{i_flux_bnd=}")
 
             from mirgecom.operators import grad_operator
-            from grudge.dof_desc import as_dofdesc
             dd_vol = as_dofdesc("vol")
             dd_faces = as_dofdesc("all_faces")
             grad_cv = grad_operator(discr, dd_vol, dd_faces, cv, cv_flux_bnd)
