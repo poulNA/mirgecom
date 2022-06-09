@@ -534,11 +534,11 @@ def main(actx_class, ctx_factory=cl.create_some_context, use_logmgr=True,
               as_dofdesc(btag).with_discr_tag(quadrature_tag), field)       
         bnd_nhat = thaw(discr.normal(btag), actx)
         bnd_tpair = TracePair(btag, interior=bnd_solution_quad, # XXX
-                                    exterior=bnd_solution_quad) # XXX
+                              exterior=bnd_solution_quad) # XXX
         flux_weak = outer(num_flux_central(bnd_tpair.int, bnd_tpair.ext), bnd_nhat)
         # flux_weak = outer(bnd_solution_quad, bnd_nhat)
         dd_all_faces = bnd_tpair.dd.with_dtag("all_faces")
-        return discr.project(btag, dd_all_faces, flux_weak)
+        return discr.project(bnd_tpair.dd, dd_all_faces, flux_weak)
 
     field_bounds = {DTAG_BOUNDARY("symmetry"): DummyBoundary(),
                     DTAG_BOUNDARY("flow"): DummyBoundary(),
@@ -576,21 +576,23 @@ def main(actx_class, ctx_factory=cl.create_some_context, use_logmgr=True,
         dvdr = grad_v[1][0]
         dvdy = grad_v[1][1]
 
-        dbetadr = 0.0 # FIXME
-        dbetady = 0.0 # FIXME
+        dbetadr = 0.0*u  # FIXME
+        dbetady = 0.0*u  # FIXME
 
-        tau_ry = 1.0*mu*(dudy + dvdr)
         tau_rr = 2.0*mu*dudr + beta*(dudr + dvdy)
+        # tau_ry = tau_rr   # this works!
+        tau_ry = mu*(dvdr + dudy)   # this is what we want (doesn't work)
         tau_yy = 2.0*mu*dvdy + beta*(dudr + dvdy)  # noqa
         tau_tt = (beta*(dudr + dvdy)
-                  + 2.0*mu*actx.np.where(actx.np.greater(nodes[0], off_axis_x), u/nodes[0], 0.0 ))
+                  + 2.0*mu*actx.np.where(nodes_are_off_axis,
+                                         u/nodes[0], 0.0*u))
 
         source_mass_dom = -(cv.momentum[0])
 
         source_rhoU_dom = (-(cv.momentum[0]*u - tau_rr + tau_tt)  # noqa
                             + u*dbetadr + beta*dudr
-                            + actx.np.where(actx.np.greater(nodes[0], off_axis_x),
-                                            -beta*u/nodes[0], 0.0))
+                            + actx.np.where(nodes_are_off_axis,
+                                            -beta*u/nodes[0], 0.0*u))
 
         source_rhoV_dom = -(cv.momentum[0]*v - tau_ry) + u*dbetady + beta*dudy  # noqa
 
@@ -600,39 +602,42 @@ def main(actx_class, ctx_factory=cl.create_some_context, use_logmgr=True,
 
         drhoudr = (grad_cv.momentum[0])[0]
 
-        d2rhodr2 = second_derivative(actx, discr, grad_cv.mass[0])[0]  # noqa
         d2udr2 = second_derivative(actx, discr, dudr)[0]
         d2udrdy = second_derivative(actx, discr, dudy)[0]
-        d2vdr2 = second_derivative(actx, discr, dvdr)[0]  # noqa
-
         dtaurydr = second_derivative(actx, discr, tau_ry)[0]
 
+        # d2udr2 = 0*u
+        # d2udrdy = 0*u
+        # dtaurydr = 0*u
+
         source_mass_sng = - drhoudr
-        source_rhoU_sng = + mu*d2udr2 + 0.5*beta*d2udr2  # noqa 
-        source_rhoV_sng = -v*drhoudr + dtaurydr + dudr*dbetady + beta*d2udrdy  # noqa
-        source_rhoE_sng = (-(cv.energy+dv.pressure)*dudr + tau_rr*dudr  # noqa
+        source_rhoU_sng = + mu*d2udr2 + 0.5*beta*d2udr2
+        source_rhoV_sng = -v*drhoudr + dudr*dbetady + beta*d2udrdy + dtaurydr
+        #source_rhoV_sng = -v*drhoudr + dtaurydr + dudr*dbetady + beta*d2udrdy
+        source_rhoE_sng = (-(cv.energy + dv.pressure)*dudr + tau_rr*dudr
                            + tau_ry*dvdr + v*dtaurydr
                            + 2.0*beta*dudr**2 + v*dudr*dbetady + beta*dudr*dvdy
-                           + v*beta*d2udrdy)
+                           + v*beta*d2udrdy
+                           )
 
-        source_mass = actx.np.where(actx.np.greater(nodes[0], off_axis_x),
+        source_mass = actx.np.where(nodes_are_off_axis,
                                 source_mass_dom/nodes[0], source_mass_sng)
-        source_rhoU = actx.np.where(actx.np.greater(nodes[0], off_axis_x),  # noqa
+        source_rhoU = actx.np.where(nodes_are_off_axis,
                                 source_rhoU_dom/nodes[0], source_rhoU_sng)
-        source_rhoV = actx.np.where(actx.np.greater(nodes[0], off_axis_x),  # noqa
+        source_rhoV = actx.np.where(nodes_are_off_axis,
                                 source_rhoV_dom/nodes[0], source_rhoV_sng )
-        source_rhoE = actx.np.where(actx.np.greater(nodes[0], off_axis_x),  # noqa
+        source_rhoE = actx.np.where(nodes_are_off_axis,
                                 source_rhoE_dom/nodes[0], source_rhoE_sng )
         source_spec = None
         if cv.nspecies > 0:
             source_spec_sng = cv.species_mass  # FIXME
             source_spec = 0*source_spec_sng
-            # source_spec = actx.np.where(actx.np.greater(nodes[0], off_axis_x),  # noqa
+            # source_spec = actx.np.where(nodes_are_off_axis,
             #                            source_spec_dom/nodes[0], source_spec_sng )
 
-        source_rhoE = 0*cv.energy
-        source_mom = 0*cv.momentum
-        source_mass = 0*cv.mass
+        source_rhoE = source_rhoE
+        source_mom = make_obj_array([source_rhoU, source_rhoV])
+        # source_mass = 0*cv.mass
 
         return make_conserved(dim=2, mass=source_mass, energy=source_rhoE,
                               momentum=source_mom,
