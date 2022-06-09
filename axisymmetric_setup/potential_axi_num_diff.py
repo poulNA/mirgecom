@@ -48,7 +48,8 @@ from mirgecom.simutil import (
     write_visfile,
     check_naninf_local,
     check_range_local,
-    global_reduce
+    global_reduce,
+    force_evaluation
 )
 from mirgecom.restart import (
     write_restart_file
@@ -86,11 +87,11 @@ from mirgecom.logging_quantities import (
     set_sim_state
 )
 
-from mirgecom.limiter import (
-    limiter_liu_osher,
-    neighbor_list,
-    positivity_preserving_limiter
-)
+#from mirgecom.limiter import (
+#    limiter_liu_osher,
+#    neighbor_list,
+#    positivity_preserving_limiter
+#)
 
 from pytools.obj_array import make_obj_array
 
@@ -245,16 +246,17 @@ def main(actx_class, ctx_factory=cl.create_some_context, use_logmgr=True,
     snapshot_pattern = restart_path+"{cname}-{step:06d}-{rank:04d}.pkl"
 
     # default i/o frequencies
-    nviz = 1
+    nviz = 5
     nrestart = 5000
-    nhealth = 1
+    nhealth = 100
     nstatus = 100
+    do_checkpoint = True
 
     # default timestepping control
     integrator = "euler"
     current_dt = 1.25e-6
-    t_final = 1.25e-6
-    
+    t_final = 1.25e-5
+
     niter = int(np.rint(t_final/current_dt))
 
     # discretization and model control
@@ -275,7 +277,7 @@ def main(actx_class, ctx_factory=cl.create_some_context, use_logmgr=True,
         error_message = "Invalid time integrator: {}".format(integrator)
         raise RuntimeError(error_message)
 
-    #if integrator == "rk2":
+    # if integrator == "rk2":
     #    timestepper = rk2_step
     if integrator == "rk4":
         timestepper = rk4_step
@@ -283,9 +285,8 @@ def main(actx_class, ctx_factory=cl.create_some_context, use_logmgr=True,
         timestepper = euler_step
     if integrator == "ssprk43":
         timestepper = ssprk43_step
-                 
-    ##################################################
-        
+
+    ##################################################  
     dim = 2
     current_t = 0
     current_step = 0
@@ -296,12 +297,12 @@ def main(actx_class, ctx_factory=cl.create_some_context, use_logmgr=True,
         print(f"\tnrestart = {nrestart}")
         print(f"\tnhealth = {nhealth}")
         print(f"\tnstatus = {nstatus}")
-        if (constant_cfl == False):
-          print(f"\tcurrent_dt = {current_dt}")
-          print(f"\tt_final = {t_final}")
+        if (constant_cfl is False):
+            print(f"\tcurrent_dt = {current_dt}")
+            print(f"\tt_final = {t_final}")
         else:
-          print(f"\tconstant_cfl = {constant_cfl}")
-          print(f"\tcurrent_cfl = {current_cfl}")
+            print(f"\tconstant_cfl = {constant_cfl}")
+            print(f"\tcurrent_cfl = {current_cfl}")
         print(f"\tniter = {niter}")
         print(f"\torder = {order}")
         print(f"\tTime integration = {integrator}")
@@ -338,7 +339,7 @@ def main(actx_class, ctx_factory=cl.create_some_context, use_logmgr=True,
     if restart_file is None:
     
         char_len = 0.025
-        box_ll = ( 0.0, 0.0)
+        box_ll = (0.0, 0.0)
         box_ur = (+0.5, 0.5)
         num_elements = (int((box_ur[0]-box_ll[0])/char_len)+1,
                             int((box_ur[1]-box_ll[1])/char_len)+1)
@@ -371,25 +372,15 @@ def main(actx_class, ctx_factory=cl.create_some_context, use_logmgr=True,
 
 ############################################################
 
-    #overintegration
-    from grudge.dof_desc import DISCR_TAG_BASE, DISCR_TAG_QUAD
-    from meshmode.discretization.poly_element import \
-        default_simplex_group_factory, QuadratureSimplexGroupFactory
     if rank == 0:
-        print('Making discretization')
+        print("Making discretization")
         logging.info("Making discretization")
-    
-    discr = EagerDGDiscretization(
-            actx, local_mesh,
-            discr_tag_to_group_factory={
-                 DISCR_TAG_BASE: default_simplex_group_factory(
-                     base_dim=local_mesh.dim, order=order),
-                 DISCR_TAG_QUAD: QuadratureSimplexGroupFactory(2*order + 1)
-            },
-            mpi_communicator=comm
-    )
+
+    from grudge.dof_desc import DISCR_TAG_QUAD
+    from mirgecom.discretization import create_discretization_collection
+    discr = create_discretization_collection(actx, local_mesh, order, comm)
     nodes = thaw(discr.nodes(), actx)
-    
+
     if use_overintegration:
         quadrature_tag = DISCR_TAG_QUAD
     else:
@@ -399,12 +390,15 @@ def main(actx_class, ctx_factory=cl.create_some_context, use_logmgr=True,
 
     current_cv = flow_init(x_vec=nodes, eos=eos, time=0.)
     current_state = construct_fluid_state(cv=current_cv)
+    current_state = force_evaluation(actx, current_state)
+
     ref_cv = ref_state(x_vec=nodes, eos=eos, time=0.)
     flow_btag = DTAG_BOUNDARY("flow")
     flow_bnd_discr = discr.discr_from_dd(flow_btag)
     flow_nodes = thaw(flow_bnd_discr.nodes(), actx)
     flow_cv = ref_state(x_vec=flow_nodes, eos=eos, time=0.)
     flow_state = construct_fluid_state(cv=flow_cv)
+    flow_state = force_evaluation(actx, flow_state)
 
     def _flow_boundary_state_func(**kwargs):
         return flow_state
@@ -443,7 +437,7 @@ def main(actx_class, ctx_factory=cl.create_some_context, use_logmgr=True,
     if logmgr:
         logmgr_add_cl_device_info(logmgr, queue)
         logmgr_set_time(logmgr, current_step, current_t)
-        #logmgr_add_package_versions(logmgr)
+        # logmgr_add_package_versions(logmgr)
 
         logmgr.add_watches([
             ("step.max", "step = {value}, "),
@@ -504,143 +498,145 @@ def main(actx_class, ctx_factory=cl.create_some_context, use_logmgr=True,
         return actx.to_numpy(nodal_max(discr, "vol", x))[()]
 
 #########################################################################
-
     from grudge.dof_desc import DOFDesc, as_dofdesc, DISCR_TAG_BASE            
     from mirgecom.flux import num_flux_central
     from arraycontext import outer
     from grudge.trace_pair import interior_trace_pairs
+    from grudge.trace_pair import interior_trace_pair
     from mirgecom.boundary import DummyBoundary
     from mirgecom.operators import grad_operator
     from grudge.trace_pair import TracePair #XXX
     from arraycontext import outer
 
     def _elbnd_flux(discr, compute_interior_flux, compute_boundary_flux,
-                int_tpair, boundaries):
-        return (compute_interior_flux(int_tpair)
+                int_tpairs, boundaries):
+        return (compute_interior_flux(int_tpairs)
             + sum(compute_boundary_flux(btag) for btag in boundaries))
-            
-            
+
+    def _elbnd_flux2(discr, compute_interior_flux, compute_boundary_flux,
+                int_tpairs, boundaries):
+        return (sum(compute_interior_flux(int_tpair)
+                    for int_tpair in int_tpairs)
+            + sum(compute_boundary_flux(btag) for btag in boundaries))
+
     def central_flux_interior(actx, discr, int_tpair):
         """Compute a central flux for interior faces."""       
         normal = thaw(discr.normal(int_tpair.dd), actx)
         flux_weak = outer(num_flux_central(int_tpair.int, int_tpair.ext), normal)
         dd_all_faces = int_tpair.dd.with_dtag("all_faces")
-        
         return discr.project(int_tpair.dd, dd_all_faces, flux_weak)
-
 
     def central_flux_boundary(actx, discr, field, btag):
         """Compute a central flux for boundary faces."""
         dd_base_vol = DOFDesc("vol")
+        # btag = as_dofdesc(btag)
         bnd_solution_quad = discr.project(dd_base_vol,      
               as_dofdesc(btag).with_discr_tag(quadrature_tag), field)       
         bnd_nhat = thaw(discr.normal(btag), actx)
-        bnd_tpair = TracePair(btag, interior=bnd_solution_quad, #XXX
-                                    exterior=bnd_solution_quad) #XXX
+        bnd_tpair = TracePair(btag, interior=bnd_solution_quad, # XXX
+                                    exterior=bnd_solution_quad) # XXX
         flux_weak = outer(num_flux_central(bnd_tpair.int, bnd_tpair.ext), bnd_nhat)
+        # flux_weak = outer(bnd_solution_quad, bnd_nhat)
         dd_all_faces = bnd_tpair.dd.with_dtag("all_faces")
-        
-        return discr.project(bnd_tpair.dd, dd_all_faces, flux_weak)
-
+        return discr.project(btag, dd_all_faces, flux_weak)
 
     field_bounds = {DTAG_BOUNDARY("symmetry"): DummyBoundary(),
-                    DTAG_BOUNDARY("inflow"): DummyBoundary(),
-                    DTAG_BOUNDARY("outflow"): DummyBoundary(),
+                    DTAG_BOUNDARY("flow"): DummyBoundary(),
                     DTAG_BOUNDARY("wall"): DummyBoundary()}
-    def second_derivative(actx,discr,field):
-        
-        int_flux = partial(central_flux_interior, actx, discr)
-        bnd_flux = partial(central_flux_boundary, actx, discr, field)        
 
-        int_tpair = interior_trace_pairs(discr, field)
-        flux_bnd = _elbnd_flux(discr, int_flux, bnd_flux, int_tpair, field_bounds)
+    def second_derivative(actx, discr, field):
+
+        int_flux = partial(central_flux_interior, actx, discr)
+        bnd_flux = partial(central_flux_boundary, actx, discr, field)
+
+        int_tpairs = interior_trace_pair(discr, field)
+        flux_bnd = _elbnd_flux(discr, int_flux, bnd_flux, int_tpairs, field_bounds)
 
         dd_vol = as_dofdesc("vol")
         dd_faces = as_dofdesc("all_faces")
-        
+
         return grad_operator(discr, dd_vol, dd_faces, field, flux_bnd)
 
 #########################################################################
+    off_axis_x = 1e-7
+    nodes_are_off_axis = actx.np.greater(nodes[0], off_axis_x)  # noqa
 
-    def axisymmetry_source_terms(actx,discr,cv,dv,mu,beta,grad_cv):
+    def axisymmetry_source_terms(actx, discr, cv, dv, mu, beta, grad_cv):
 
         nodes = thaw(discr.nodes(), actx)
-        
-        u = cv.momentum[0]/cv.mass
-        v = cv.momentum[1]/cv.mass
-        
-        qr = u*0.0 #FIXME
-       
-        grad_v = velocity_gradient(cv,grad_cv)
+
+        u = cv.velocity[0]
+        v = cv.velocity[1]
+
+        qr = u*0.0 # FIXME
+
+        grad_v = velocity_gradient(cv, grad_cv)
         dudr = grad_v[0][0]
         dudy = grad_v[0][1]
         dvdr = grad_v[1][0]
         dvdy = grad_v[1][1]
-        
-        dbetadr = 0.0 #FIXME
-        dbetady = 0.0 #FIXME
-        
+
+        dbetadr = 0.0 # FIXME
+        dbetady = 0.0 # FIXME
+
         tau_ry = 1.0*mu*(dudy + dvdr)
         tau_rr = 2.0*mu*dudr + beta*(dudr + dvdy)
-        tau_yy = 2.0*mu*dvdy + beta*(dudr + dvdy)
-        tau_tt = beta*(dudr + dvdy) + 2.0*mu*actx.np.where(
-                              actx.np.greater(nodes[0],1e-7), u/nodes[0], 0.0 )
+        tau_yy = 2.0*mu*dvdy + beta*(dudr + dvdy)  # noqa
+        tau_tt = (beta*(dudr + dvdy)
+                  + 2.0*mu*actx.np.where(actx.np.greater(nodes[0], off_axis_x), u/nodes[0], 0.0 ))
 
-        """
-        """
-        source_mass_dom = -(  cv.momentum[0] )
-        
-        source_rhoU_dom = -(  cv.momentum[0]*u - tau_rr + tau_tt ) \
-                           + u*dbetadr + beta*dudr \
-                           + actx.np.where(
-                              actx.np.greater(nodes[0],1e-7), -beta*u/nodes[0], 0.0 )
-                              
-        source_rhoV_dom = -(  cv.momentum[0]*v - tau_ry ) \
-                           + u*dbetady + beta*dudy
-        
-        source_rhoE_dom = -( (cv.energy+dv.pressure)*u - u*tau_rr - v*tau_ry + qr ) \
-                           + u**2*dbetadr + beta*2.0*u*dudr \
-                           + u*v*dbetady + u*beta*dvdy + v*beta*dudy
+        source_mass_dom = -(cv.momentum[0])
 
-        source_spec_dom = cv.species_mass_fractions #FIXME
-        """
-        """
-        
+        source_rhoU_dom = (-(cv.momentum[0]*u - tau_rr + tau_tt)  # noqa
+                            + u*dbetadr + beta*dudr
+                            + actx.np.where(actx.np.greater(nodes[0], off_axis_x),
+                                            -beta*u/nodes[0], 0.0))
+
+        source_rhoV_dom = -(cv.momentum[0]*v - tau_ry) + u*dbetady + beta*dudy  # noqa
+
+        source_rhoE_dom = (-((cv.energy+dv.pressure)*u - u*tau_rr - v*tau_ry + qr) # noqa
+                           + u**2*dbetadr + beta*2.0*u*dudr
+                           + u*v*dbetady + u*beta*dvdy + v*beta*dudy)
+
         drhoudr = (grad_cv.momentum[0])[0]
 
-        d2rhodr2 = second_derivative(actx,discr,grad_cv.mass[0])[0]
-        d2udr2   = second_derivative(actx,discr,dudr)[0]
-        d2udrdy  = second_derivative(actx,discr,dudy)[0]
-        d2vdr2   = second_derivative(actx,discr,dvdr)[0]
-        
-        dtaurydr = second_derivative(actx,discr,tau_ry)[0]
-        
+        d2rhodr2 = second_derivative(actx, discr, grad_cv.mass[0])[0]  # noqa
+        d2udr2 = second_derivative(actx, discr, dudr)[0]
+        d2udrdy = second_derivative(actx, discr, dudy)[0]
+        d2vdr2 = second_derivative(actx, discr, dvdr)[0]  # noqa
+
+        dtaurydr = second_derivative(actx, discr, tau_ry)[0]
+
         source_mass_sng = - drhoudr
-        source_rhoU_sng = + mu*d2udr2 + 0.5*beta*d2udr2
-        source_rhoV_sng = - v*drhoudr + dtaurydr + \
-                                + dudr*dbetady + beta*d2udrdy
-        source_rhoE_sng = -(cv.energy+dv.pressure)*dudr + tau_rr*dudr + \
-                                 tau_ry*dvdr + v*dtaurydr \
-                                + 2.0*beta*dudr**2 + v*dudr*dbetady + beta*dudr*dvdy + v*beta*d2udrdy
-        
-        source_spec_sng = cv.species_mass_fractions #FIXME
-        
-        """
-        """
-        source_mass = actx.np.where( actx.np.greater(nodes[0],1e-7),
-                                source_mass_dom/nodes[0], source_mass_sng )
-        source_rhoU = actx.np.where( actx.np.greater(nodes[0],1e-7),
-                                source_rhoU_dom/nodes[0], source_rhoU_sng )
-        source_rhoV = actx.np.where( actx.np.greater(nodes[0],1e-7),
+        source_rhoU_sng = + mu*d2udr2 + 0.5*beta*d2udr2  # noqa 
+        source_rhoV_sng = -v*drhoudr + dtaurydr + dudr*dbetady + beta*d2udrdy  # noqa
+        source_rhoE_sng = (-(cv.energy+dv.pressure)*dudr + tau_rr*dudr  # noqa
+                           + tau_ry*dvdr + v*dtaurydr
+                           + 2.0*beta*dudr**2 + v*dudr*dbetady + beta*dudr*dvdy
+                           + v*beta*d2udrdy)
+
+        source_mass = actx.np.where(actx.np.greater(nodes[0], off_axis_x),
+                                source_mass_dom/nodes[0], source_mass_sng)
+        source_rhoU = actx.np.where(actx.np.greater(nodes[0], off_axis_x),  # noqa
+                                source_rhoU_dom/nodes[0], source_rhoU_sng)
+        source_rhoV = actx.np.where(actx.np.greater(nodes[0], off_axis_x),  # noqa
                                 source_rhoV_dom/nodes[0], source_rhoV_sng )
-        source_rhoE = actx.np.where( actx.np.greater(nodes[0],1e-7),
+        source_rhoE = actx.np.where(actx.np.greater(nodes[0], off_axis_x),  # noqa
                                 source_rhoE_dom/nodes[0], source_rhoE_sng )
-        source_spec = actx.np.where( actx.np.greater(nodes[0],1e-7),
-                                source_spec_dom/nodes[0], source_spec_sng )
-        
+        source_spec = None
+        if cv.nspecies > 0:
+            source_spec_sng = cv.species_mass  # FIXME
+            source_spec = 0*source_spec_sng
+            # source_spec = actx.np.where(actx.np.greater(nodes[0], off_axis_x),  # noqa
+            #                            source_spec_dom/nodes[0], source_spec_sng )
+
+        source_rhoE = 0*cv.energy
+        source_mom = 0*cv.momentum
+        source_mass = 0*cv.mass
+
         return make_conserved(dim=2, mass=source_mass, energy=source_rhoE,
-                       momentum=make_obj_array([source_rhoU,source_rhoV]),
-                       species_mass=source_spec)
+                              momentum=source_mom,
+                              species_mass=source_spec)
 
 #########################################################################
 
@@ -683,11 +679,11 @@ def main(actx_class, ctx_factory=cl.create_some_context, use_logmgr=True,
             dvdr = grad_v[1][0]
             dvdy = grad_v[1][1]
             
-            d2rhodr2 = second_derivative(actx,discr,grad_cv.mass[0])[0]
-            d2udr2   = second_derivative(actx,discr,dudr)[0]
-            d2udrdy  = second_derivative(actx,discr,dudy)[0]
-            d2vdr2   = second_derivative(actx,discr,dvdr)[0]
-            
+            #            d2rhodr2 = second_derivative(actx,discr,grad_cv.mass[0])[0]
+            #            d2udr2   = second_derivative(actx,discr,dudr)[0]
+            #            d2udrdy  = second_derivative(actx,discr,dudy)[0]
+            #            d2vdr2   = second_derivative(actx,discr,dvdr)[0]
+
             viz_ext = [("ref_U", ref_cv.momentum/ref_cv.mass),
                        ("ref_mass", ref_cv_state.mass_density),
                        ("ref_P", ref_cv_state.pressure),
@@ -697,19 +693,19 @@ def main(actx_class, ctx_factory=cl.create_some_context, use_logmgr=True,
                        ("diff_P", dv.pressure - ref_cv_state.pressure),
                        ("diff_T", dv.temperature - ref_cv_state.temperature),
                        ("rhs", rhs),
-                       ("source", sources),
+                       # ("source", sources),
                        ("grad_mom_Ux", grad_cv.momentum[0][0]),
                        ("grad_mom_Uy", grad_cv.momentum[0][1]),
                        ("grad_mom_Vx", grad_cv.momentum[1][0]),
                        ("grad_mom_Vy", grad_cv.momentum[1][1]),
-                       ("grad_d2rhodr2", d2rhodr2),
-                       ("grad_d2udr2", d2udr2),
-                       ("grad_d2udrdy", d2udrdy),
-                       ("grad_d2vdr2", d2vdr2),
+                       # ("grad_d2rhodr2", d2rhodr2),
+                       # ("grad_d2udr2", d2udr2),
+                       # ("grad_d2udrdy", d2udrdy),
+                       # ("grad_d2vdr2", d2vdr2),
                        ("grad_mass", grad_cv.mass),                      
                        ("grad_P", grad_P),
                        ("grad_T", grad_t),
-                       ("dt" if constant_cfl else "cfl", ts_field)
+                       # ("dt" if constant_cfl else "cfl", ts_field)
                       ]
             viz_fields.extend(viz_ext)
                       
@@ -735,8 +731,8 @@ def main(actx_class, ctx_factory=cl.create_some_context, use_logmgr=True,
 
     def my_health_check(cv, dv):
         health_error = False
-        pressure = thaw(freeze(dv.pressure, actx), actx)
-        temperature = thaw(freeze(dv.temperature, actx), actx)
+        pressure = dv.pressure
+        temperature = dv.temperature
 
         if global_reduce(check_naninf_local(discr, "vol", pressure), op="lor"):
             health_error = True
@@ -765,62 +761,89 @@ def main(actx_class, ctx_factory=cl.create_some_context, use_logmgr=True,
 #########################################################################
 
     from mirgecom.fluid import velocity_gradient
-    from mirgecom.simutil import compare_fluid_solutions
-    import os
-    def my_pre_step(step, t, dt, state):       
+    # from mirgecom.simutil import compare_fluid_solutions
+    # import os
 
-        if logmgr:
-            logmgr.tick_before()
+    def my_pre_step(step, t, dt, state):
+        fluid_state = None
 
-        fluid_state = make_fluid_state(cv=state, gas_model=gas_model)
-        dv = fluid_state.dv
-        cv = fluid_state.cv
+        try:
 
-        ts_field, cfl, dt = my_get_timestep(t, dt, fluid_state)
-        log_cfl.set_quantity(cfl)
-        
-        ns_rhs, grad_cv, grad_t = \
-            ns_operator(discr, state=fluid_state, time=t,
-                        boundaries=boundaries, gas_model=gas_model,
-                        return_gradients=True, quadrature_tag=quadrature_tag)
-        
-        beta = fluid_state.tv.volume_viscosity         
-        sources = axisymmetry_source_terms(
-                       actx, discr, fluid_state.cv, fluid_state.dv, mu, beta, grad_cv)
+            if logmgr:
+                logmgr.tick_before()
 
-        ns_rhs = ns_rhs + sources
-        
-        if (step == 0):
-            error = compare_fluid_solutions(discr, ns_rhs, cv.mass*0.0)
-            if (mu < 1e-14):
-              error_data = "echo " + str(amplitude) + " " + str(error) + " >> error_Ma_dependence_inv_compState_p=" + str(order) + ".dat"
-            else:
-              error_data = "echo " + str(amplitude) + " " + str(error) + " >> error_Ma_dependence_muXXXX_compState_p=" + str(order) + ".dat"
-            os.system(error_data)
-                                                
-        my_write_viz(step=step, t=t, cv=cv, dv=dv,
-                     ts_field=ts_field, ref_cv=ref_cv, rhs=ns_rhs,
-                     grad_cv=grad_cv, grad_t=grad_t,
-                     sources=sources)
+            if do_checkpoint:
+
+                do_viz = check_step(step=step, interval=nviz)
+                do_restart = check_step(step=step, interval=nrestart)
+                do_health = check_step(step=step, interval=nhealth)
+                do_status = check_step(step=step, interval=nstatus)
+
+                # If we plan on doing anything with the state, then
+                # we need to make sure it is evaluated first.
+                if any([do_viz, do_restart, do_health, do_status, constant_cfl]):
+                    fluid_state = construct_fluid_state(state)
+                    fluid_state = force_evaluation(actx, fluid_state)
+
+                dt = get_sim_timestep(discr, fluid_state, t=t, dt=dt,
+                                      cfl=current_cfl, t_final=t_final,
+                                      constant_cfl=constant_cfl)
+
+                if do_health:
+                    dv = fluid_state.dv
+                    cv = fluid_state.cv
+                    health_errors = global_reduce(my_health_check(cv, dv), op="lor")
+                    if health_errors:
+                        if rank == 0:
+                            logger.info("Fluid solution failed health check.")
+                        raise MyRuntimeError("Failed simulation health check.")
+
+                # if do_status:
+                #    my_write_status(dt=dt, cfl=current_cfl, dv=dv)
+
+                if do_restart:
+                    my_write_restart(step=step, t=t, cv=cv)
+
+                if do_viz:
+                    dv = fluid_state.dv
+                    cv = fluid_state.cv
+                    ts_field, cfl, dt_viz = my_get_timestep(t, dt, fluid_state)
+                    # log_cfl.set_quantity(cfl)
+
+                    ns_rhs, grad_cv, grad_t = \
+                        ns_operator(discr, state=fluid_state, time=t,
+                                    boundaries=boundaries, gas_model=gas_model,
+                                    return_gradients=True,
+                                    quadrature_tag=quadrature_tag)
+
+                    # beta = fluid_state.tv.volume_viscosity         
+                    # sources = axisymmetry_source_terms(
+                    #    actx, discr, fluid_state.cv, fluid_state.dv, mu, beta, grad_cv)
+                    #
+                    # ns_rhs = ns_rhs + sources
+                    sources = None
+                    my_write_viz(step=step, t=t, cv=cv, dv=dv,
+                                 ts_field=ts_field, ref_cv=ref_cv, rhs=ns_rhs,
+                                 grad_cv=grad_cv, grad_t=grad_t,
+                                 sources=sources)
+
+        except MyRuntimeError:
+            if rank == 0:
+                logger.info("Errors detected; attempting graceful exit.")
+            raise
 
         return state, dt
-        
 
     def my_post_step(step, t, dt, state):
-       
-        fluid_state = make_fluid_state(cv=state, gas_model=gas_model)
-
         if logmgr:
             set_dt(logmgr, dt)
-            set_sim_state(logmgr, dim, fluid_state.cv, gas_model.eos)
             logmgr.tick_after()
-        return fluid_state.cv, dt
-                                                           
+        return state, dt
 
     def my_rhs(t, state):
 
         fluid_state = make_fluid_state(cv=state, gas_model=gas_model)
-     
+
         cv_rhs, grad_cv, grad_t = (
             ns_operator(discr, state=fluid_state, time=t,
                         boundaries=boundaries, gas_model=gas_model,
@@ -829,7 +852,7 @@ def main(actx_class, ctx_factory=cl.create_some_context, use_logmgr=True,
         
         beta = fluid_state.tv.volume_viscosity
         sources = axisymmetry_source_terms(
-                               actx, discr, fluid_state.cv, fluid_state.dv, mu, beta, grad_cv)
+            actx, discr, fluid_state.cv, fluid_state.dv, mu, beta, grad_cv)
 
         return cv_rhs + sources
 
@@ -846,6 +869,7 @@ def main(actx_class, ctx_factory=cl.create_some_context, use_logmgr=True,
                       state=current_state.cv,
                       dt=current_dt, t_final=t_final, t=current_t,
                       istep=current_step)
+
     current_state = make_fluid_state(cv=current_cv, gas_model=gas_model)
 
     # Dump the final data

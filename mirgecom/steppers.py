@@ -120,12 +120,14 @@ def _advance_state_stepper_func(rhs, timestepper, state, t_final, dt=0,
 
     compiled_rhs = _compile_rhs(actx, rhs)
 
+    state = _force_evaluation(actx, state)
+
     while t < t_final:
-        state = _force_evaluation(actx, state)
 
         if pre_step_callback is not None:
             state, dt = pre_step_callback(state=state, step=istep, t=t, dt=dt)
 
+        state = _force_evaluation(actx, state)
         state = timestepper(state=state, t=t, dt=dt, rhs=compiled_rhs)
 
         t += dt

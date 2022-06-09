@@ -1,4 +1,4 @@
-"""Prediction-adjacent performance tester."""
+"""Predictionf-adjacent performance tester."""
 
 __copyright__ = """
 Copyright (C) 2020 University of Illinois Board of Trustees
@@ -45,6 +45,7 @@ from mirgecom.simutil import (
     get_sim_timestep,
     generate_and_distribute_mesh,
     write_visfile,
+    force_evaluation
 )
 from mirgecom.io import make_init_message
 from mirgecom.mpi import mpi_entry_point
@@ -52,6 +53,7 @@ from mirgecom.integrators import (
     rk4_step, euler_step,
     lsrk54_step, lsrk144_step
 )
+from grudge.shortcuts import compiled_lsrk45_step
 from mirgecom.steppers import advance_state
 from mirgecom.initializers import (
     MixtureInitializer,
@@ -162,7 +164,8 @@ def main(ctx_factory=cl.create_some_context, use_logmgr=True,
          use_leap=False, use_overintegration=False,
          use_profiling=False, casename=None, lazy=False,
          rst_filename=None, actx_class=PyOpenCLArrayContext,
-         log_dependent=False, input_file=None):
+         log_dependent=False, input_file=None,
+         force_eval=True):
     """Drive example."""
     cl_ctx = ctx_factory()
 
@@ -181,7 +184,7 @@ def main(ctx_factory=cl.create_some_context, use_logmgr=True,
     # {{{ Some discretization parameters
 
     dim = 3
-    order = 1
+    order = 3
 
     # - scales the size of the domain
     x_scale = 1
@@ -259,7 +262,7 @@ def main(ctx_factory=cl.create_some_context, use_logmgr=True,
 
     # coarse-scale grid/domain control
     n_refine = 1  # scales npts/axis uniformly
-    weak_scale = 1  # scales domain and npts/axis keeping dt constant
+    weak_scale = 1  # scales domain uniformly, keeping dt constant
 
     # AV / Shock-capturing parameters
     alpha_sc = 0.5
@@ -380,6 +383,11 @@ def main(ctx_factory=cl.create_some_context, use_logmgr=True,
         except KeyError:
             pass
         try:
+            if force_eval:
+                force_eval = bool(input_data["force_eval"])
+        except KeyError:
+            pass
+        try:
             nviz = int(input_data["nviz"])
         except KeyError:
             pass
@@ -477,7 +485,7 @@ def main(ctx_factory=cl.create_some_context, use_logmgr=True,
             pass
 
     # param sanity check
-    allowed_integrators = ["rk4", "euler", "lsrk54", "lsrk144"]
+    allowed_integrators = ["rk4", "euler", "lsrk54", "lsrk144", "compiled_lsrk45"]
     if integrator not in allowed_integrators:
         error_message = "Invalid time integrator: {}".format(integrator)
         raise RuntimeError(error_message)
@@ -490,6 +498,7 @@ def main(ctx_factory=cl.create_some_context, use_logmgr=True,
         print(f"\t{single_gas_only=},{dummy_rhs_only=}")
         print(f"\t{periodic_boundary=},{adiabatic_boundary=}")
         print(f"\t{timestepping_on=}, {inviscid_only=}")
+        print(f"\t{force_eval=}")
         print(f"\t{av_on=}, {sponge_on=}, {do_callbacks=}")
         print(f"\t{nspecies=}, {init_only=}")
         print(f"\t{health_pres_min=}, {health_pres_max=}")
@@ -532,14 +541,6 @@ def main(ctx_factory=cl.create_some_context, use_logmgr=True,
         else:
             print("\tDependent variable logging is OFF.")
         print("#### Simluation control data: ####")
-
-    timestepper = rk4_step
-    if integrator == "euler":
-        timestepper = euler_step
-    if integrator == "lsrk54":
-        timestepper = lsrk54_step
-    if integrator == "lsrk144":
-        timestepper = lsrk144_step
 
     xsize = domain_xlen*x_scale*weak_scale
     ysize = domain_ylen*y_scale*weak_scale
@@ -631,21 +632,27 @@ def main(ctx_factory=cl.create_some_context, use_logmgr=True,
     if grid_only:
         return 0
 
-    from grudge.dof_desc import DISCR_TAG_BASE, DISCR_TAG_QUAD
-    from meshmode.discretization.poly_element import \
-        default_simplex_group_factory, QuadratureSimplexGroupFactory
+    from grudge.dof_desc import DISCR_TAG_QUAD
+    from mirgecom.discretization import create_discretization_collection
 
-    discr = EagerDGDiscretization(
-        actx, local_mesh,
-        discr_tag_to_group_factory={
-            DISCR_TAG_BASE: default_simplex_group_factory(
-                base_dim=local_mesh.dim, order=order),
-            DISCR_TAG_QUAD: QuadratureSimplexGroupFactory(2*order + 1)
-        },
-        mpi_communicator=comm
-    )
+    discr = create_discretization_collection(actx, local_mesh, order, comm)
     nodes = thaw(discr.nodes(), actx)
     ones = discr.zeros(actx) + 1.0
+
+    def _compiled_stepper_wrapper(state, t, dt, rhs):
+        return compiled_lsrk45_step(actx, state, t, dt, rhs)
+
+    timestepper = rk4_step
+
+    if integrator == "euler":
+        timestepper = euler_step
+    if integrator == "lsrk54":
+        timestepper = lsrk54_step
+    if integrator == "lsrk144":
+        timestepper = lsrk144_step
+    if integrator == "compiled_lsrk45":
+        timestepper = _compiled_stepper_wrapper
+        force_eval = False
 
     def vol_min(x):
         from grudge.op import nodal_min
@@ -777,9 +784,10 @@ def main(ctx_factory=cl.create_some_context, use_logmgr=True,
             eos = PyrometheusMixture(pyro_mechanism,
                                      temperature_guess=temperature_seed)
         else:
-            from mirgecom.thermochemistry import get_pyrometheus_wrapper_class
-            from mirgecom.mechanisms.uiuc import Thermochemistry
-            pyro_mechanism = get_pyrometheus_wrapper_class(Thermochemistry)(actx.np)
+            from mirgecom.thermochemistry \
+                import get_thermochemistry_class_by_mechanism_name
+            pyro_mechanism = \
+                get_thermochemistry_class_by_mechanism_name("uiuc")(actx.np)
             nspecies = pyro_mechanism.num_species
             # species_names = pyro_mechanism.species_names
             eos = PyrometheusMixture(pyro_mechanism,
@@ -1018,11 +1026,6 @@ def main(ctx_factory=cl.create_some_context, use_logmgr=True,
 
     def my_pre_step(step, t, dt, state):
         cv, tseed = state
-        fluid_state = construct_fluid_state(cv, tseed)
-        dv = fluid_state.dv
-
-        dt = get_sim_timestep(discr, fluid_state, t=t, dt=dt, cfl=current_cfl,
-                              t_final=t_final, constant_cfl=constant_cfl)
 
         try:
 
@@ -1030,11 +1033,24 @@ def main(ctx_factory=cl.create_some_context, use_logmgr=True,
                 logmgr.tick_before()
 
             if do_checkpoint:
+
+                fluid_state = construct_fluid_state(cv, tseed)
+                dv = fluid_state.dv
+
                 from mirgecom.simutil import check_step
                 do_viz = check_step(step=step, interval=nviz)
                 do_restart = check_step(step=step, interval=nrestart)
                 do_health = check_step(step=step, interval=nhealth)
                 do_status = check_step(step=step, interval=nstatus)
+
+                # If we plan on doing anything with the state, then
+                # we need to make sure it is evaluated first.
+                if any([do_viz, do_restart, do_health, do_status, constant_cfl]):
+                    fluid_state = force_evaluation(actx, fluid_state)
+
+                dt = get_sim_timestep(discr, fluid_state, t=t, dt=dt,
+                                      cfl=current_cfl, t_final=t_final,
+                                      constant_cfl=constant_cfl)
 
                 if do_health:
                     health_errors = global_reduce(my_health_check(cv, dv), op="lor")
@@ -1063,8 +1079,6 @@ def main(ctx_factory=cl.create_some_context, use_logmgr=True,
     def my_post_step(step, t, dt, state):
         cv, tseed = state
 
-        # Logmgr needs to know about EOS, dt, dim?
-        # imo this is a design/scope flaw
         if logmgr:
             set_dt(logmgr, dt)
             if log_dependent:
@@ -1172,23 +1186,24 @@ def main(ctx_factory=cl.create_some_context, use_logmgr=True,
         if rank == 0:
             print(f"Timestepping: {current_step=}, {current_t=}, {t_final=},"
                   f" {current_dt=}")
-
         current_step, current_t, current_state = \
             advance_state(rhs=my_rhs, timestepper=timestepper,
                           pre_step_callback=pre_step_func, istep=current_step,
                           post_step_callback=post_step_func, dt=current_dt,
-                          state=make_obj_array([current_cv, temperature_seed]),
-                          t=current_t, t_final=t_final)
+                          state=current_state, t=current_t, t_final=t_final,
+                          force_eval=force_eval)
 
     # Dump the final data
     if rank == 0:
         logger.info("Checkpointing final state ...")
 
-    final_cv, tseed = current_state
+    final_cv, tseed = force_evaluation(actx, current_state)
     final_fluid_state = construct_fluid_state(final_cv, tseed)
+    final_fluid_state = force_evaluation(actx, final_fluid_state)
+
     final_dv = final_fluid_state.dv
     dt = get_sim_timestep(discr, final_fluid_state, current_t, current_dt,
-                                  current_cfl, t_final, constant_cfl)
+                          current_cfl, t_final, constant_cfl)
 
     my_write_viz(step=current_step, t=current_t, cv=final_cv, dv=final_dv)
     my_write_status(dt=dt, cfl=current_cfl, dv=final_dv)
@@ -1223,6 +1238,8 @@ if __name__ == "__main__":
                         nargs="?", action="store", help="simulation config file")
     parser.add_argument("--lazy", action="store_true",
         help="switch to a lazy computation mode")
+    parser.add_argument("--no-force", action="store_true",
+        help="Turn off force lazy eval between timesteps")
     parser.add_argument("--profiling", action="store_true",
         help="turn on detailed performance profiling")
     parser.add_argument("--log", action="store_true", default=True,
@@ -1236,6 +1253,7 @@ if __name__ == "__main__":
     warn("Automatically turning off DV logging. MIRGE-Com Issue(578)")
     lazy = args.lazy
     log_dependent = False
+    force_eval = not args.no_force
     if args.profiling:
         if lazy:
             raise ValueError("Can't use lazy and profiling together.")
@@ -1261,6 +1279,6 @@ if __name__ == "__main__":
          use_overintegration=args.overintegration,
          use_profiling=args.profiling, lazy=lazy,
          casename=casename, rst_filename=rst_filename, actx_class=actx_class,
-         log_dependent=log_dependent)
+         log_dependent=log_dependent, force_eval=force_eval)
 
 # vim: foldmethod=marker
