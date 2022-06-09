@@ -1,5 +1,4 @@
-"""
-"""
+"""Test axisymmetry."""
 
 __copyright__ = """
 Copyright (C) 2020 University of Illinois Board of Trustees
@@ -314,8 +313,9 @@ def main(actx_class, ctx_factory=cl.create_some_context, use_logmgr=True,
     kappa = 0.0  # Pr = mu*cp/kappa = 0.75
     mu = 0.0
     transport_model = SimpleTransport(viscosity=mu, thermal_conductivity=kappa)
+    eos = IdealSingleGas()
 
-    gas_model = GasModel(eos=IdealSingleGas(), transport=transport_model)                 
+    gas_model = GasModel(eos=eos, transport=transport_model)                 
 
     def get_fluid_state(cv):
         return make_fluid_state(cv=cv, gas_model=gas_model)
@@ -328,35 +328,9 @@ def main(actx_class, ctx_factory=cl.create_some_context, use_logmgr=True,
     flow_init = PotentialFlow(dim=dim, temperature=300.0,
                                     mass=1.0,
                                     amplitude=amplitude)
-
     ref_state = PotentialFlow(dim=dim, temperature=300.0,
                                     mass=1.0,
                                     amplitude=amplitude)
-
-    def _inflow_func(nodes, cv, eos, **kwargs):
-        return ref_state(x_vec=nodes, eos=IdealSingleGas(), time=0.)
-
-    def _boundary_state_func(discr, btag, gas_model, state_minus, init_func,
-                             **kwargs):
-        actx = state_minus.array_context
-        bnd_discr = discr.discr_from_dd(btag)
-        nodes = thaw(bnd_discr.nodes(), actx)
-        return make_fluid_state(init_func(nodes=nodes, eos=gas_model.eos,
-                                          cv=state_minus.cv, **kwargs),
-                                gas_model=gas_model)
-
-    def _inflow_boundary_state(discr, btag, gas_model, state_minus, **kwargs):
-        return _boundary_state_func(discr, btag, gas_model, state_minus,
-                                    _inflow_func, **kwargs)
-   
-    wall_symmetry = SymmetryBoundary()
-    inflow_boundary = PrescribedFluidBoundary(boundary_state_func=_inflow_boundary_state)
-    outflow_boundary = PrescribedFluidBoundary(boundary_state_func=_inflow_boundary_state)
-
-    boundaries = {DTAG_BOUNDARY("symmetry"): wall_symmetry,
-                  DTAG_BOUNDARY("inflow"): inflow_boundary,
-                  DTAG_BOUNDARY("outflow"): outflow_boundary,
-                  DTAG_BOUNDARY("wall"): wall_symmetry}
 
     ##################################################
 
@@ -377,9 +351,9 @@ def main(actx_class, ctx_factory=cl.create_some_context, use_logmgr=True,
                                 mesh_type="X",
                                 boundary_tag_to_face={
                                     "wall": ["-y"],
-                                    "inflow": ["+y"],
-                                    "symmetry": ["-x"],
-                                    "outflow": ["+x"]})
+                                    "flow": ["+x", "+y"],
+                                    "symmetry": ["-x"]})
+
         local_mesh, global_nelements = (
             generate_and_distribute_mesh(comm, generate_mesh))
         local_nelements = local_mesh.nelements
@@ -423,11 +397,44 @@ def main(actx_class, ctx_factory=cl.create_some_context, use_logmgr=True,
 
     ##################################################
 
-    current_cv = flow_init(x_vec=nodes, eos=IdealSingleGas(), time=0.)
+    current_cv = flow_init(x_vec=nodes, eos=eos, time=0.)
     current_state = construct_fluid_state(cv=current_cv)
+    ref_cv = ref_state(x_vec=nodes, eos=eos, time=0.)
+    flow_btag = DTAG_BOUNDARY("flow")
+    flow_bnd_discr = discr.discr_from_dd(flow_btag)
+    flow_nodes = thaw(flow_bnd_discr.nodes(), actx)
+    flow_cv = ref_state(x_vec=flow_nodes, eos=eos, time=0.)
+    flow_state = construct_fluid_state(cv=flow_cv)
 
-    ref_cv = ref_state(x_vec=nodes, eos=IdealSingleGas(), time=0.)
+    def _flow_boundary_state_func(**kwargs):
+        return flow_state
 
+    # def _boundary_state_func(discr, btag, gas_model, state_minus, init_func,
+    #                         **kwargs):
+    #    actx = state_minus.array_context
+    #    bnd_discr = discr.discr_from_dd(btag)
+    #    nodes = thaw(bnd_discr.nodes(), actx)
+    #    return make_fluid_state(init_func(nodes=nodes, eos=gas_model.eos,
+    #                                      cv=state_minus.cv, **kwargs),
+    #                            gas_model=gas_model)
+
+    # def _inflow_boundary_state(discr, btag, gas_model, state_minus, **kwargs):
+    #    return _boundary_state_func(discr, btag, gas_model, state_minus,
+    #                                _inflow_func, **kwargs)
+   
+    wall_symmetry = SymmetryBoundary()
+    flow_boundary = \
+        PrescribedFluidBoundary(boundary_state_func=_flow_boundary_state_func)
+    # outflow_boundary = \
+    #    PrescribedFluidBoundary(boundary_state_func=_inflow_boundary_state)
+
+    # DTAG_BOUNDARY("inflow"): inflow_boundary,
+    # DTAG_BOUNDARY("outflow"): outflow_boundary,
+    boundaries = {DTAG_BOUNDARY("symmetry"): wall_symmetry,
+                  DTAG_BOUNDARY("flow"): flow_boundary,
+                  DTAG_BOUNDARY("wall"): wall_symmetry}
+
+    
     ##################################################
 
     vis_timer = None
