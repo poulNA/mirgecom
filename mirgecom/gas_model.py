@@ -239,6 +239,11 @@ class ViscousFluidState(FluidState):
         return self.tv.bulk_viscosity
 
     @property
+    def volume_viscosity(self):
+        """Return the fluid bulk viscosity."""
+        return self.tv.volume_viscosity
+
+    @property
     def thermal_conductivity(self):
         """Return the fluid thermal conductivity."""
         return self.tv.thermal_conductivity

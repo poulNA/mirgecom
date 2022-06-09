@@ -820,12 +820,24 @@ class OutflowBoundary(PrescribedFluidBoundary):
         boundary_speed = actx.np.sqrt(np.dot(boundary_vel, boundary_vel))
         speed_of_sound = state_minus.speed_of_sound
         kinetic_energy = gas_model.eos.kinetic_energy(state_minus.cv)
-        gamma = gas_model.eos.gamma(state_minus.cv, state_minus.temperature)
-        external_pressure = 2*self._pressure - state_minus.pressure
-        boundary_pressure = actx.np.where(actx.np.greater(boundary_speed,
-                                                          speed_of_sound),
-                                          state_minus.pressure, external_pressure)
-        internal_energy = boundary_pressure / (gamma - 1)
+
+#  IdealGas()        
+#        gamma = gas_model.eos.gamma(state_minus.cv, state_minus.temperature)
+#        external_pressure = 2.0*self._pressure - state_minus.pressure
+#        boundary_pressure = actx.np.where(actx.np.greater(boundary_speed,
+#                                                          speed_of_sound),
+#                                          state_minus.pressure, external_pressure)
+#        internal_energy = (boundary_pressure / (gamma - 1.0))
+
+#  Mixture()
+        ##FIXME: will not work with supersonic cases:
+        ##       Modify to include the "actx.np.where" statement!
+        external_pressure = 2.0*self._pressure - state_minus.pressure
+        external_temperature = external_pressure/(state_minus.cv.mass*gas_model.eos.gas_const(state_minus.cv))
+        internal_energy = state_minus.cv.mass*gas_model.eos.get_internal_energy(
+                                        external_temperature,
+                                        state_minus.cv.species_mass/state_minus.cv.mass)
+
         total_energy = internal_energy + kinetic_energy
         cv_outflow = make_conserved(dim=state_minus.dim, mass=state_minus.cv.mass,
                                     momentum=state_minus.cv.momentum,

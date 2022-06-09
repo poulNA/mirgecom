@@ -75,6 +75,7 @@ class GasTransportVars:
 
     bulk_viscosity: np.ndarray
     viscosity: np.ndarray
+    volume_viscosity: np.ndarray
     thermal_conductivity: np.ndarray
     species_diffusivity: np.ndarray
 
@@ -127,6 +128,7 @@ class TransportModel:
         r"""Compute the transport properties from the conserved state."""
         return GasTransportVars(
             bulk_viscosity=self.bulk_viscosity(cv=cv, dv=dv),
+            volume_viscosity=self.volume_viscosity(cv=cv, dv=dv),
             viscosity=self.viscosity(cv=cv, dv=dv),
             thermal_conductivity=self.thermal_conductivity(cv=cv, dv=dv, eos=eos),
             species_diffusivity=self.species_diffusivity(cv=cv, dv=dv, eos=eos)
